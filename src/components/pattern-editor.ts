@@ -12,7 +12,8 @@ import {
  *
  * List mode: navigate, delete with 'd', add with 'a', edit with 'e'/Enter.
  * Form mode: three-field form (pattern + description + regex toggle),
- *            Tab to switch fields, Enter to submit, Escape to cancel.
+ *            Tab to switch fields, Ctrl+R to toggle regex, Enter to submit,
+ *            Escape to cancel.
  */
 
 export interface PatternItem {
@@ -256,7 +257,7 @@ export class PatternEditor implements Component {
 
     lines.push(
       this.theme.hint(
-        "  Tab: switch field · Space: toggle regex · Enter: next/submit · Esc: cancel",
+        "  Tab: switch field · Ctrl+R: toggle regex · Enter: next/submit · Esc: cancel",
       ),
     );
 
@@ -308,17 +309,18 @@ export class PatternEditor implements Component {
       return;
     }
 
+    if (matchesKey(data, Key.ctrl("r"))) {
+      this.regexEnabled = !this.regexEnabled;
+      return;
+    }
+
     if (matchesKey(data, Key.escape)) {
       this.cancelForm();
       return;
     }
 
-    // Regex toggle: space toggles when on regex field
     if (this.activeField === "regex") {
-      if (data === " " || matchesKey(data, Key.enter)) {
-        this.regexEnabled = !this.regexEnabled;
-      }
-      // Enter on regex field submits if we already have a pattern
+      // Enter on regex field submits if we already have a pattern.
       if (matchesKey(data, Key.enter) && this.patternInput.getValue().trim()) {
         this.submitForm();
       }

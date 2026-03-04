@@ -1,16 +1,20 @@
 import {
+  FuzzySelector,
   getNestedValue,
   registerSettingsCommand,
   SettingsDetailEditor,
   type SettingsDetailField,
   type SettingsSection,
+  type SettingsTheme,
   setNestedValue,
+  Wizard,
 } from "@aliou/pi-utils-settings";
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { getSettingsListTheme } from "@mariozechner/pi-coding-agent";
 import {
   type Component,
   Input,
+  Key,
+  matchesKey,
   type SettingItem,
   type SettingsListTheme,
 } from "@mariozechner/pi-tui";
@@ -38,6 +42,57 @@ const FEATURE_UI: Record<FeatureKey, { label: string; description: string }> = {
   },
 };
 
+const POLICY_EXAMPLES: Array<{
+  label: string;
+  description: string;
+  rule: PolicyRule;
+}> = [
+  {
+    label: "Secrets (.env)",
+    description: "Block dotenv-like files (glob)",
+    rule: {
+      id: "example-secret-env-files",
+      name: "Secret env files",
+      description: "Block .env files and variants",
+      patterns: [{ pattern: ".env" }, { pattern: ".env.*" }],
+      allowedPatterns: [
+        { pattern: ".env.example" },
+        { pattern: "*.sample.env" },
+      ],
+      protection: "noAccess",
+      onlyIfExists: true,
+      enabled: true,
+    },
+  },
+  {
+    label: "Logs (*.log)",
+    description: "Mark log files read-only (glob)",
+    rule: {
+      id: "example-log-files",
+      name: "Log files",
+      description: "Treat log files as read-only",
+      patterns: [{ pattern: "*.log" }, { pattern: "*.out" }],
+      protection: "readOnly",
+      onlyIfExists: true,
+      enabled: true,
+    },
+  },
+  {
+    label: "Regex env",
+    description: "Regex match for .env and .env.*",
+    rule: {
+      id: "example-regex-env",
+      name: "Regex env files",
+      description: "Regex example for env files",
+      patterns: [{ pattern: "^\\.env(\\..+)?$", regex: true }],
+      allowedPatterns: [{ pattern: "^\\.env\\.example$", regex: true }],
+      protection: "noAccess",
+      onlyIfExists: true,
+      enabled: true,
+    },
+  },
+];
+
 function toKebabCase(input: string): string {
   return input
     .trim()
@@ -46,58 +101,282 @@ function toKebabCase(input: string): string {
     .replace(/^-+|-+$/g, "");
 }
 
-class AddRuleSubmenu implements Component {
-  private readonly onCreate: (name: string) => number | null;
-  private readonly openEditor: (
-    index: number,
-    done: (value?: string) => void,
-  ) => Component;
-  private readonly onDone: (value?: string) => void;
-  private readonly theme: SettingsListTheme;
-  private readonly nameInput = new Input();
-  private activeEditor: Component | null = null;
+function appendPolicyRule(
+  config: GuardrailsConfig | null,
+  example: PolicyRule,
+): GuardrailsConfig {
+  const next = structuredClone(config ?? {}) as GuardrailsConfig;
+  const currentRules = next.policies?.rules ?? [];
+
+  const existingIds = new Set(currentRules.map((rule) => rule.id));
+  const baseId =
+    toKebabCase(example.id || example.name || "example") || "example";
+  let id = baseId;
+  let i = 2;
+  while (existingIds.has(id)) {
+    id = `${baseId}-${i}`;
+    i++;
+  }
+
+  const rule = structuredClone(example);
+  rule.id = id;
+
+  next.policies = {
+    ...(next.policies ?? {}),
+    rules: [...currentRules, rule],
+  };
+
+  return next;
+}
+
+interface NewPolicyDraft {
+  name: string;
+  id: string;
+  protection: PolicyRule["protection"];
+  patterns: PatternConfig[];
+}
+
+class PolicyNameStep implements Component {
+  private readonly input = new Input();
+
+  constructor(
+    private readonly theme: SettingsListTheme,
+    private readonly state: NewPolicyDraft,
+    private readonly onComplete: () => void,
+  ) {
+    this.input.setValue(state.name);
+    this.input.onSubmit = () => {
+      const name = this.input.getValue().trim();
+      if (!name) return;
+      this.state.name = name;
+      if (!this.state.id) {
+        this.state.id = toKebabCase(name) || "policy";
+      }
+      this.onComplete();
+    };
+  }
+
+  invalidate() {}
+
+  render(width: number): string[] {
+    return [
+      this.theme.hint("  Step 1: Policy name"),
+      "",
+      ...this.input.render(Math.max(1, width - 2)).map((line) => ` ${line}`),
+      "",
+      this.theme.hint("  Example: Secret files"),
+      this.theme.hint("  Enter to continue"),
+    ];
+  }
+
+  handleInput(data: string): void {
+    this.input.handleInput(data);
+  }
+}
+
+class PolicyProtectionStep implements Component {
+  private readonly selector: FuzzySelector;
 
   constructor(
     theme: SettingsListTheme,
-    onCreate: (name: string) => number | null,
+    state: NewPolicyDraft,
+    onComplete: () => void,
+  ) {
+    this.selector = new FuzzySelector({
+      label: "Protection",
+      items: ["noAccess", "readOnly", "none"],
+      currentValue: state.protection,
+      theme,
+      onSelect: (value) => {
+        if (value === "noAccess" || value === "readOnly" || value === "none") {
+          state.protection = value;
+          onComplete();
+        }
+      },
+      onDone: () => {
+        // Esc is handled by Wizard.
+      },
+    });
+  }
+
+  invalidate(): void {
+    this.selector.invalidate?.();
+  }
+
+  render(width: number): string[] {
+    return this.selector.render(width);
+  }
+
+  handleInput(data: string): void {
+    this.selector.handleInput(data);
+  }
+}
+
+class PolicyPatternsStep implements Component {
+  private readonly editor: PatternEditor;
+
+  constructor(
+    theme: SettingsListTheme,
+    state: NewPolicyDraft,
+    onComplete: () => void,
+  ) {
+    this.editor = new PatternEditor({
+      label: "Policy patterns",
+      context: "file",
+      theme,
+      items: state.patterns.map((p) => ({
+        pattern: p.pattern,
+        description: p.pattern,
+        regex: p.regex,
+      })),
+      onSave: (items) => {
+        state.patterns = items
+          .map((item) => {
+            const pattern = item.pattern.trim();
+            if (!pattern) return null;
+            return {
+              pattern,
+              ...(item.regex ? { regex: true } : {}),
+            };
+          })
+          .filter((item): item is PatternConfig => item !== null);
+      },
+      onDone: () => {
+        if (state.patterns.length > 0) {
+          onComplete();
+        }
+      },
+    });
+  }
+
+  invalidate(): void {
+    this.editor.invalidate?.();
+  }
+
+  render(width: number): string[] {
+    return this.editor.render(width);
+  }
+
+  handleInput(data: string): void {
+    this.editor.handleInput(data);
+  }
+}
+
+class PolicyReviewStep implements Component {
+  constructor(
+    private readonly theme: SettingsListTheme,
+    private readonly state: NewPolicyDraft,
+  ) {}
+
+  invalidate() {}
+
+  render(_width: number): string[] {
+    const patternPreview =
+      this.state.patterns.length > 0
+        ? this.state.patterns
+            .slice(0, 3)
+            .map((p) => `${p.pattern}${p.regex ? " [regex]" : ""}`)
+            .join(", ")
+        : "(none)";
+
+    return [
+      this.theme.hint("  Review"),
+      "",
+      this.theme.hint(`  Name: ${this.state.name || "(empty)"}`),
+      this.theme.hint(`  ID: ${this.state.id || "(auto)"}`),
+      this.theme.hint(`  Protection: ${this.state.protection}`),
+      this.theme.hint(`  Patterns: ${this.state.patterns.length}`),
+      this.theme.hint(`  ${patternPreview}`),
+      "",
+      this.theme.hint("  Ctrl+S: create + open editor · Esc: cancel"),
+    ];
+  }
+
+  handleInput(_data: string): void {}
+}
+
+class AddRuleSubmenu implements Component {
+  private readonly wizard: Wizard;
+  private activeEditor: Component | null = null;
+
+  constructor(
+    theme: SettingsTheme,
+    onCreate: (draft: NewPolicyDraft) => number | null,
     openEditor: (index: number, done: (value?: string) => void) => Component,
     onDone: (value?: string) => void,
   ) {
-    this.theme = theme;
-    this.onCreate = onCreate;
-    this.openEditor = openEditor;
-    this.onDone = onDone;
-
-    this.nameInput.onSubmit = () => {
-      const name = this.nameInput.getValue().trim();
-      if (!name) return;
-      const index = this.onCreate(name);
-      if (index === null) return;
-      this.activeEditor = this.openEditor(index, (value) => {
-        this.activeEditor = null;
-        this.onDone(value);
-      });
+    const state: NewPolicyDraft = {
+      name: "",
+      id: "",
+      protection: "readOnly",
+      patterns: [],
     };
-    this.nameInput.onEscape = () => this.onDone();
+
+    this.wizard = new Wizard({
+      title: "Add policy",
+      theme,
+      steps: [
+        {
+          label: "Name",
+          build: (ctx) =>
+            new PolicyNameStep(theme, state, () => {
+              ctx.markComplete();
+              ctx.goNext();
+            }),
+        },
+        {
+          label: "Protection",
+          build: (ctx) =>
+            new PolicyProtectionStep(theme, state, () => {
+              ctx.markComplete();
+              ctx.goNext();
+            }),
+        },
+        {
+          label: "Patterns",
+          build: (ctx) =>
+            new PolicyPatternsStep(theme, state, () => {
+              if (state.patterns.length === 0) {
+                ctx.markIncomplete();
+                return;
+              }
+              ctx.markComplete();
+              ctx.goNext();
+            }),
+        },
+        {
+          label: "Review",
+          build: (ctx) => {
+            ctx.markComplete();
+            return new PolicyReviewStep(theme, state);
+          },
+        },
+      ],
+      onComplete: () => {
+        if (!state.name.trim() || state.patterns.length === 0) return;
+        const index = onCreate(state);
+        if (index === null) return;
+        this.activeEditor = openEditor(index, (value) => {
+          this.activeEditor = null;
+          onDone(value);
+        });
+      },
+      onCancel: () => onDone(),
+      hintSuffix: "complete steps · Ctrl+S create",
+      minContentHeight: 12,
+    });
   }
 
-  invalidate() {
+  invalidate(): void {
     this.activeEditor?.invalidate?.();
+    this.wizard.invalidate?.();
   }
 
   render(width: number): string[] {
     if (this.activeEditor) {
       return this.activeEditor.render(width);
     }
-
-    return [
-      this.theme.label("+ Add policy", true),
-      "",
-      this.theme.hint("  Enter policy name:"),
-      ...this.nameInput.render(width - 2).map((line) => ` ${line}`),
-      "",
-      this.theme.hint("  Enter: create + edit · Esc: back"),
-    ];
+    return this.wizard.render(width);
   }
 
   handleInput(data: string): void {
@@ -105,8 +384,70 @@ class AddRuleSubmenu implements Component {
       this.activeEditor.handleInput?.(data);
       return;
     }
+    this.wizard.handleInput(data);
+  }
+}
 
-    this.nameInput.handleInput(data);
+class ScopePickerSubmenu implements Component {
+  private selectedIndex = 0;
+
+  constructor(
+    private readonly theme: SettingsListTheme,
+    private readonly scopes: Array<"global" | "local" | "memory">,
+    private readonly onSelect: (scope: "global" | "local" | "memory") => void,
+    private readonly onDone: (value?: string) => void,
+  ) {}
+
+  invalidate() {}
+
+  render(_width: number): string[] {
+    const lines: string[] = [
+      this.theme.label(" Add example to scope", true),
+      "",
+      this.theme.hint("  Select target scope:"),
+    ];
+
+    for (let i = 0; i < this.scopes.length; i++) {
+      const scope = this.scopes[i];
+      if (!scope) continue;
+      const isSelected = i === this.selectedIndex;
+      const prefix = isSelected ? this.theme.cursor : "  ";
+      lines.push(`${prefix}${this.theme.value(scope, isSelected)}`);
+    }
+
+    lines.push("");
+    lines.push(this.theme.hint("  Enter: apply · Esc: back"));
+    return lines;
+  }
+
+  handleInput(data: string): void {
+    if (matchesKey(data, Key.up) || data === "k") {
+      this.selectedIndex =
+        this.selectedIndex === 0
+          ? this.scopes.length - 1
+          : this.selectedIndex - 1;
+      return;
+    }
+
+    if (matchesKey(data, Key.down) || data === "j") {
+      this.selectedIndex =
+        this.selectedIndex === this.scopes.length - 1
+          ? 0
+          : this.selectedIndex + 1;
+      return;
+    }
+
+    if (matchesKey(data, Key.enter)) {
+      const scope = this.scopes[this.selectedIndex];
+      if (!scope) return;
+      this.onSelect(scope);
+      this.onDone(`applied to ${scope}`);
+      return;
+    }
+
+    if (matchesKey(data, Key.escape)) {
+      this.onDone();
+    }
   }
 }
 
@@ -316,39 +657,40 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
     configStore: configLoader,
     buildSections: (
       tabConfig: GuardrailsConfig | null,
-      resolved: ResolvedConfig,
-      { setDraft },
+      _resolved: ResolvedConfig,
+      { setDraft, theme },
     ): SettingsSection[] => {
-      const settingsTheme = getSettingsListTheme();
+      const settingsTheme = theme;
+      let scopedConfig = structuredClone(tabConfig ?? {}) as GuardrailsConfig;
+
+      function commitDraft(next: GuardrailsConfig): void {
+        scopedConfig = next;
+        setDraft(structuredClone(next));
+      }
 
       function count(id: string): string {
         const val =
-          (getNestedValue(tabConfig ?? {}, id) as unknown[] | undefined) ??
-          (getNestedValue(resolved, id) as unknown[]) ??
-          [];
+          (getNestedValue(scopedConfig, id) as unknown[] | undefined) ?? [];
         return `${val.length} items`;
       }
 
       function applyDraft(id: string, value: unknown): void {
-        const updated = structuredClone(tabConfig ?? {}) as GuardrailsConfig;
+        const updated = structuredClone(scopedConfig);
         setNestedValue(updated, id, value);
-        setDraft(updated);
+        commitDraft(updated);
       }
 
       function getPolicyRules(): PolicyRule[] {
-        return (
-          tabConfig?.policies?.rules?.map((r) => ({ ...r })) ??
-          resolved.policies.rules.map((r) => ({ ...r }))
-        );
+        return scopedConfig.policies?.rules?.map((r) => ({ ...r })) ?? [];
       }
 
       function setPolicyRules(rules: PolicyRule[]): void {
-        const updated = structuredClone(tabConfig ?? {}) as GuardrailsConfig;
+        const updated = structuredClone(scopedConfig);
         updated.policies = {
           ...(updated.policies ?? {}),
           rules,
         };
-        setDraft(updated);
+        commitDraft(updated);
       }
 
       function updateRule(
@@ -369,12 +711,12 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
         setPolicyRules(rules);
       }
 
-      function addRule(name: string): number | null {
-        const normalizedName = name.trim();
-        if (!normalizedName) return null;
+      function addRule(draft: NewPolicyDraft): number | null {
+        const normalizedName = draft.name.trim();
+        if (!normalizedName || draft.patterns.length === 0) return null;
 
         const rules = getPolicyRules();
-        const baseId = toKebabCase(normalizedName) || "policy";
+        const baseId = toKebabCase(draft.id || normalizedName) || "policy";
         const existingIds = new Set(rules.map((rule) => rule.id));
 
         let id = baseId;
@@ -388,8 +730,8 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
           id,
           name: normalizedName,
           description: "",
-          patterns: [{ pattern: "" }],
-          protection: "readOnly",
+          patterns: draft.patterns,
+          protection: draft.protection,
           onlyIfExists: true,
           enabled: true,
         });
@@ -404,11 +746,9 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
       ) {
         return (_val: string, submenuDone: (v?: string) => void) => {
           const items =
-            (getNestedValue(tabConfig ?? {}, id) as
+            (getNestedValue(scopedConfig, id) as
               | DangerousPattern[]
-              | undefined) ??
-            (getNestedValue(resolved, id) as DangerousPattern[]) ??
-            [];
+              | undefined) ?? [];
           let latestCount = items.length;
           return new PatternEditor({
             label,
@@ -431,10 +771,7 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
       ) {
         return (_val: string, submenuDone: (v?: string) => void) => {
           const currentItems =
-            (getNestedValue(tabConfig ?? {}, id) as
-              | PatternConfig[]
-              | undefined) ??
-            (getNestedValue(resolved, id) as PatternConfig[]) ??
+            (getNestedValue(scopedConfig, id) as PatternConfig[] | undefined) ??
             [];
           const items = currentItems.map((p) => ({
             pattern: p.pattern,
@@ -465,31 +802,39 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
         };
       }
 
-      function getExplainModel(): string {
-        const model = tabConfig?.permissionGate?.explainModel;
-        if (model !== undefined) return model;
-        return resolved.permissionGate.explainModel ?? "";
+      function hasExplainModelOverride(): boolean {
+        return scopedConfig.permissionGate?.explainModel !== undefined;
       }
 
-      function getExplainTimeout(): number {
-        return (
-          tabConfig?.permissionGate?.explainTimeout ??
-          resolved.permissionGate.explainTimeout
-        );
+      function getExplainModel(): string {
+        return scopedConfig.permissionGate?.explainModel?.trim() ?? "";
+      }
+
+      function hasExplainTimeoutOverride(): boolean {
+        return scopedConfig.permissionGate?.explainTimeout !== undefined;
+      }
+
+      function getExplainTimeout(): number | null {
+        return scopedConfig.permissionGate?.explainTimeout ?? null;
       }
 
       const featureItems = (Object.keys(FEATURE_UI) as FeatureKey[])
         .filter((key) => key !== "policies")
-        .map((key) => ({
-          id: `features.${key}`,
-          label: FEATURE_UI[key].label,
-          description: FEATURE_UI[key].description,
-          currentValue:
-            (tabConfig?.features?.[key] ?? resolved.features[key])
-              ? "enabled"
-              : "disabled",
-          values: ["enabled", "disabled"],
-        }));
+        .map((key) => {
+          const scopedValue = scopedConfig.features?.[key];
+          return {
+            id: `features.${key}`,
+            label: FEATURE_UI[key].label,
+            description: FEATURE_UI[key].description,
+            currentValue:
+              scopedValue === undefined
+                ? "(inherited)"
+                : scopedValue
+                  ? "enabled"
+                  : "disabled",
+            values: ["enabled", "disabled"],
+          };
+        });
 
       const policyRules = getPolicyRules();
 
@@ -512,9 +857,11 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
           label: "  Enabled",
           description: FEATURE_UI.policies.description,
           currentValue:
-            (tabConfig?.features?.policies ?? resolved.features.policies)
-              ? "enabled"
-              : "disabled",
+            scopedConfig.features?.policies === undefined
+              ? "(inherited)"
+              : scopedConfig.features.policies
+                ? "enabled"
+                : "disabled",
           values: ["enabled", "disabled"],
         },
         ...policyRules.map((rule, index) => {
@@ -533,7 +880,7 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
       policyItems.push({
         id: "policies.addRule",
         label: "  + Add policy",
-        description: "Create policy, then open editor",
+        description: "Open wizard to create policy",
         currentValue: "",
         submenu: (_val: string, submenuDone: (v?: string) => void) =>
           new AddRuleSubmenu(
@@ -559,10 +906,11 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
               description:
                 "Show confirmation dialog for dangerous commands (if off, just warns)",
               currentValue:
-                (tabConfig?.permissionGate?.requireConfirmation ??
-                resolved.permissionGate.requireConfirmation)
-                  ? "on"
-                  : "off",
+                scopedConfig.permissionGate?.requireConfirmation === undefined
+                  ? "(inherited)"
+                  : scopedConfig.permissionGate.requireConfirmation
+                    ? "on"
+                    : "off",
               values: ["on", "off"],
             },
             {
@@ -605,17 +953,20 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
               description:
                 "Call an LLM to explain dangerous commands in the confirmation dialog",
               currentValue:
-                (tabConfig?.permissionGate?.explainCommands ??
-                resolved.permissionGate.explainCommands)
-                  ? "on"
-                  : "off",
+                scopedConfig.permissionGate?.explainCommands === undefined
+                  ? "(inherited)"
+                  : scopedConfig.permissionGate.explainCommands
+                    ? "on"
+                    : "off",
               values: ["on", "off"],
             },
             {
               id: "permissionGate.explainModel",
               label: "Explain model",
               description: "Model spec in provider/model-id format",
-              currentValue: getExplainModel() || "(not set)",
+              currentValue: hasExplainModelOverride()
+                ? getExplainModel() || "(not set)"
+                : "(inherited)",
               submenu: (_val: string, submenuDone: (v?: string) => void) =>
                 new SettingsDetailEditor({
                   title: "Explain Commands: Model",
@@ -645,20 +996,28 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
               id: "permissionGate.explainTimeout",
               label: "Explain timeout",
               description: "Timeout for LLM explanation in milliseconds",
-              currentValue: `${getExplainTimeout()}ms`,
+              currentValue: hasExplainTimeoutOverride()
+                ? `${getExplainTimeout()}ms`
+                : "(inherited)",
               submenu: (_val: string, submenuDone: (v?: string) => void) =>
                 new SettingsDetailEditor({
                   title: "Explain Commands: Timeout",
                   theme: settingsTheme,
                   onDone: submenuDone,
-                  getDoneSummary: () => `${getExplainTimeout()}ms`,
+                  getDoneSummary: () => {
+                    const timeout = getExplainTimeout();
+                    return timeout === null ? "(not set)" : `${timeout}ms`;
+                  },
                   fields: [
                     {
                       id: "permissionGate.explainTimeout",
                       type: "text",
                       label: "Timeout (ms)",
                       description: "Abort explanation call after this many ms",
-                      getValue: () => String(getExplainTimeout()),
+                      getValue: () => {
+                        const timeout = getExplainTimeout();
+                        return timeout === null ? "" : String(timeout);
+                      },
                       setValue: (value) => {
                         const parsed = Number.parseInt(value.trim(), 10);
                         if (Number.isNaN(parsed) || parsed < 1) return;
@@ -672,5 +1031,46 @@ export function registerGuardrailsSettings(pi: ExtensionAPI): void {
         },
       ];
     },
+    extraTabs: [
+      {
+        id: "examples",
+        label: "Examples",
+        buildSections: ({
+          enabledScopes,
+          getDraftForScope,
+          getRawForScope,
+          setDraftForScope,
+          theme,
+        }): SettingsSection[] => {
+          const items: SettingItem[] = POLICY_EXAMPLES.map((example) => ({
+            id: `examples.${example.rule.id}`,
+            label: `  ${example.label}`,
+            description: example.description,
+            currentValue: "apply",
+            submenu: (_val: string, submenuDone: (v?: string) => void) =>
+              new ScopePickerSubmenu(
+                theme,
+                enabledScopes,
+                (targetScope) => {
+                  const baseConfig =
+                    getDraftForScope(targetScope) ??
+                    getRawForScope(targetScope) ??
+                    null;
+                  const updated = appendPolicyRule(baseConfig, example.rule);
+                  setDraftForScope(targetScope, updated);
+                },
+                submenuDone,
+              ),
+          }));
+
+          return [
+            {
+              label: "Policy presets",
+              items,
+            },
+          ];
+        },
+      },
+    ],
   });
 }
