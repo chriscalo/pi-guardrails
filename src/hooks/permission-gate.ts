@@ -580,21 +580,19 @@ export function setupPermissionGateHook(
 
       type ConfirmResult = "allow" | "allow-session" | "deny";
 
-      let result = await ctx.ui.custom<ConfirmResult>(
-        createPermissionGateConfirmComponent(command, description, explanation),
+      const title = explanation
+        ? `${description}\n\n${explanation.text}`
+        : `${description}\n\n${command}`;
+
+      const selection = await ctx.ui.select(
+        `Dangerous command: ${title}`,
+        ["Allow once", "Allow for session", "Deny"],
       );
 
-      // ctx.ui.custom() returns undefined in RPC/headless mode.
-      // Fall back to ctx.ui.select() which works in all modes.
-      if (result === undefined) {
-        const selection = await ctx.ui.select(
-          `Dangerous command: ${description}`,
-          ["Allow once", "Allow for session", "Deny"],
-        );
-        if (selection === "Allow once") result = "allow";
-        else if (selection === "Allow for session") result = "allow-session";
-        else result = "deny"; // undefined (timeout/cancel) = deny
-      }
+      let result: ConfirmResult;
+      if (selection === "Allow once") result = "allow";
+      else if (selection === "Allow for session") result = "allow-session";
+      else result = "deny"; // undefined (timeout/cancel) = deny
 
       if (result === "allow-session") {
         // Save command as allowed in memory scope (session-only).
